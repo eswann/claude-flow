@@ -294,6 +294,81 @@ const AGENT_PATTERNS: Record<string, string[]> = {
   '.scss': ['coder', 'designer'],
 };
 
+// ── Runtime routing outcome persistence ──────────────────────────────
+// Closes the learning loop: post-task records outcomes → route loads them.
+
+const ROUTING_OUTCOMES_PATH = join(resolve('.'), '.claude-flow/routing-outcomes.json');
+
+const ROUTING_STOPWORDS = new Set([
+  'the','a','an','is','are','was','were','be','been','being','have','has','had',
+  'do','does','did','will','would','could','should','may','might','shall','can',
+  'to','of','in','for','on','with','at','by','from','as','into','through','during',
+  'before','after','above','below','between','under','again','further','then','once',
+  'it','its','this','that','these','those','i','me','my','we','our','you','your',
+  'he','she','they','them','and','but','or','nor','not','no','so','if','when','than',
+  'very','just','also','only','both','each','all','any','few','more','most','other',
+  'some','such','same','new','now','here','there','where','how','what','which','who',
+]);
+
+interface RoutingOutcome {
+  task: string;
+  agent: string;
+  success: boolean;
+  quality: number;
+  keywords: string[];
+  timestamp: string;
+}
+
+function extractKeywords(text: string): string[] {
+  if (!text) return [];
+  return text.toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, ' ')
+    .split(/\s+/)
+    .filter(w => w.length > 2 && !ROUTING_STOPWORDS.has(w));
+}
+
+function loadRoutingOutcomes(): RoutingOutcome[] {
+  try {
+    if (existsSync(ROUTING_OUTCOMES_PATH)) {
+      const data = JSON.parse(readFileSync(ROUTING_OUTCOMES_PATH, 'utf-8'));
+      return data.outcomes || [];
+    }
+  } catch { /* corrupt file, start fresh */ }
+  return [];
+}
+
+function saveRoutingOutcomes(outcomes: RoutingOutcome[]): void {
+  try {
+    const dir = ROUTING_OUTCOMES_PATH.replace(/[/\\][^/\\]+$/, '');
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    // Cap at 500 entries to bound file size
+    const capped = outcomes.slice(-500);
+    writeFileSync(ROUTING_OUTCOMES_PATH, JSON.stringify({ outcomes: capped }, null, 2));
+  } catch { /* non-critical */ }
+}
+
+function loadLearnedPatterns(): Record<string, { agents: string[]; confidence: number }> {
+  const outcomes = loadRoutingOutcomes();
+  const byAgent: Record<string, Set<string>> = {};
+  for (const o of outcomes) {
+    if (!o.success || !o.agent || !o.keywords?.length) continue;
+    if (!byAgent[o.agent]) byAgent[o.agent] = new Set();
+    for (const kw of o.keywords) byAgent[o.agent].add(kw);
+  }
+  const patterns: Record<string, { agents: string[]; confidence: number }> = {};
+  for (const [agent, kwSet] of Object.entries(byAgent)) {
+    patterns[`learned-${agent}`] = {
+      agents: [agent],
+      confidence: 0.75, // learned patterns get slightly lower base confidence
+    };
+    // Also register individual keywords so suggestAgentsForTask can match them
+    void kwSet; // keywords tracked for future semantic matching
+  }
+  return patterns;
+}
+
+// ── Static keyword patterns ──────────────────────────────────────────
+
 const TASK_PATTERNS: Record<string, { agents: string[]; confidence: number }> = {
   'authentication': { agents: ['security-architect', 'coder', 'tester'], confidence: 0.9 },
   'auth': { agents: ['security-architect', 'coder', 'tester'], confidence: 0.85 },
@@ -333,9 +408,31 @@ function suggestAgentsForFile(filePath: string): string[] {
 function suggestAgentsForTask(task: string): { agents: string[]; confidence: number } {
   const taskLower = task.toLowerCase();
 
+  // Check static keyword patterns first
   for (const [pattern, result] of Object.entries(TASK_PATTERNS)) {
     if (taskLower.includes(pattern)) {
       return result;
+    }
+  }
+
+  // Check runtime-learned patterns from successful task outcomes
+  const taskKeywords = extractKeywords(task);
+  if (taskKeywords.length > 0) {
+    const outcomes = loadRoutingOutcomes();
+    let bestAgent = '';
+    let bestOverlap = 0;
+
+    for (const outcome of outcomes) {
+      if (!outcome.success || !outcome.agent || !outcome.keywords?.length) continue;
+      const overlap = taskKeywords.filter(kw => outcome.keywords.includes(kw)).length;
+      if (overlap > bestOverlap) {
+        bestOverlap = overlap;
+        bestAgent = outcome.agent;
+      }
+    }
+
+    if (bestAgent && bestOverlap >= 2) {
+      return { agents: [bestAgent], confidence: Math.min(0.6 + bestOverlap * 0.05, 0.85) };
     }
   }
 
@@ -749,22 +846,63 @@ export const hooksPostTask: MCPTool = {
       success: { type: 'boolean', description: 'Whether task was successful' },
       agent: { type: 'string', description: 'Agent that completed the task' },
       quality: { type: 'number', description: 'Quality score (0-1)' },
+      task: { type: 'string', description: 'Task description text (used for learning keyword extraction)' },
+      storeDecisions: { type: 'boolean', description: 'Also store routing decision in memory DB' },
     },
     required: ['taskId'],
   },
   handler: async (params: Record<string, unknown>) => {
+    const startTime = Date.now();
     const taskId = params.taskId as string;
     const success = params.success !== false;
+    const agent = params.agent as string | undefined;
     const quality = (params.quality as number) || (success ? 0.85 : 0.3);
+    const taskText = (params.task as string) || '';
 
+    // Persist routing outcome for runtime learning
+    const outcomeKeywords = extractKeywords(taskText);
+    let outcomePersisted = false;
+    if (taskText && agent) {
+      try {
+        const outcomes = loadRoutingOutcomes();
+        outcomes.push({
+          task: taskText,
+          agent,
+          success,
+          quality,
+          keywords: outcomeKeywords,
+          timestamp: new Date().toISOString(),
+        });
+        saveRoutingOutcomes(outcomes);
+        outcomePersisted = true;
+      } catch { /* non-critical */ }
+    }
+
+    // Optionally store in memory DB for cross-session retrieval
+    if (params.storeDecisions && taskText && agent) {
+      try {
+        const storeFn = await getRealStoreFunction();
+        if (storeFn) {
+          await storeFn({
+            key: `routing-decision:${taskId}`,
+            namespace: 'patterns',
+            value: JSON.stringify({ task: taskText, agent, success, quality, keywords: outcomeKeywords }),
+            tags: ['routing-decision'],
+          });
+        }
+      } catch { /* non-critical */ }
+    }
+
+    const duration = Date.now() - startTime;
     return {
       taskId,
       success,
-      duration: Math.floor(Math.random() * 300) + 60, // 1-6 minutes in seconds
+      duration,
       learningUpdates: {
         patternsUpdated: success ? 2 : 1,
         newPatterns: success ? 1 : 0,
         trajectoryId: `traj-${Date.now()}`,
+        outcomePersisted,
       },
       quality,
       timestamp: new Date().toISOString(),
